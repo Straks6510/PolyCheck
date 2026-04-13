@@ -1,0 +1,12 @@
+# Ignore everything in the venv
+*
+
+# But track source files
+!.gitignore
+!CLAUDE.md
+!*.py
+!*.txt
+!*.md
+!*.toml
+!*.cfg
+!src/
