@@ -14,6 +14,9 @@ events
   category    TEXT
   fetched_at  TEXT                — ISO-8601 UTC, set on every upsert
   raw         TEXT                — full JSON blob for forward-compatibility
+
+favorites
+  event_id    TEXT  PRIMARY KEY   — Polymarket event id
 """
 
 import json
@@ -38,6 +41,9 @@ CREATE TABLE IF NOT EXISTS events (
     raw           TEXT    NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_events_end_date ON events (end_date);
+CREATE TABLE IF NOT EXISTS favorites (
+    event_id      TEXT    PRIMARY KEY
+);
 """
 
 
@@ -91,6 +97,23 @@ def upsert_events(events: list[dict[str, Any]]) -> int:
     return len(rows)
 
 
+def delete_stale_events(current_ids: list[str]) -> int:
+    """
+    Delete events whose IDs are not in current_ids.
+    Returns the number of rows deleted.
+    Skips deletion if current_ids is empty (safety guard).
+    """
+    if not current_ids:
+        return 0
+    placeholders = ",".join("?" * len(current_ids))
+    with _connect() as conn:
+        cur = conn.execute(
+            f"DELETE FROM events WHERE id NOT IN ({placeholders})",
+            current_ids,
+        )
+        return cur.rowcount
+
+
 def load_events() -> list[dict[str, Any]]:
     """
     Return all stored events as dicts (the original raw JSON objects),
@@ -110,6 +133,32 @@ def last_fetched_at() -> str | None:
             "SELECT MAX(fetched_at) AS ts FROM events"
         ).fetchone()
     return row["ts"] if row else None
+
+
+# ---------------------------------------------------------------------------
+# Favorites
+# ---------------------------------------------------------------------------
+
+def load_favorites() -> set[str]:
+    """Return the set of all favorited event IDs."""
+    with _connect() as conn:
+        rows = conn.execute("SELECT event_id FROM favorites").fetchall()
+    return {r["event_id"] for r in rows}
+
+
+def add_favorite(event_id: str) -> None:
+    """Mark an event as a favorite."""
+    with _connect() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO favorites (event_id) VALUES (?)",
+            (event_id,),
+        )
+
+
+def remove_favorite(event_id: str) -> None:
+    """Remove an event from favorites."""
+    with _connect() as conn:
+        conn.execute("DELETE FROM favorites WHERE event_id = ?", (event_id,))
 
 
 def _float(value) -> float | None:
