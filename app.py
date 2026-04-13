@@ -29,13 +29,14 @@ from PyQt6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QStatusBar,
+    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
-from PyQt6.QtGui import QColor, QFont, QPainter, QPalette
+from PyQt6.QtCore import Qt, QThread, QEvent, pyqtSignal, QTimer
+from PyQt6.QtGui import QColor, QFont, QPainter, QPalette, QStandardItem, QStandardItemModel
 
 from py_clob_client.client import ClobClient
 
@@ -140,6 +141,105 @@ def _parse_yes_no(market: dict) -> tuple[float | None, float | None]:
         return None, None
 
 
+class CheckableComboBox(QComboBox):
+    """A combo box where every item has a checkbox — supports multi-category filtering."""
+
+    selectionChanged = pyqtSignal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setModel(QStandardItemModel(self))
+        self.setEditable(True)
+        self.lineEdit().setReadOnly(True)
+        self.lineEdit().setPlaceholderText("All categories")
+        self.lineEdit().installEventFilter(self)
+        self.view().pressed.connect(self._on_item_pressed)
+        self._dirty = False  # tracks whether anything changed during current popup
+
+    # ------------------------------------------------------------------
+    # Popup control — keep open while clicking items; close on outside click
+    # ------------------------------------------------------------------
+
+    def eventFilter(self, obj, event) -> bool:
+        if obj is self.lineEdit() and event.type() == QEvent.Type.MouseButtonRelease:
+            if self.view().isVisible():
+                super().hidePopup()
+            else:
+                super().showPopup()
+            return True
+        return super().eventFilter(obj, event)
+
+    def hidePopup(self) -> None:
+        super().hidePopup()
+        if self._dirty:
+            self._dirty = False
+            self.selectionChanged.emit()
+
+    def showPopup(self) -> None:
+        self._dirty = False
+        super().showPopup()
+
+    # ------------------------------------------------------------------
+    # Item management
+    # ------------------------------------------------------------------
+
+    def addItem(self, text: str, data=None) -> None:  # type: ignore[override]
+        item = QStandardItem(text)
+        item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable)
+        item.setData(Qt.CheckState.Unchecked, Qt.ItemDataRole.CheckStateRole)
+        self.model().appendRow(item)
+        self._refresh_text()
+
+    def clear(self) -> None:
+        self.model().clear()
+        self._refresh_text()
+
+    def _on_item_pressed(self, index) -> None:
+        item = self.model().itemFromIndex(index)
+        new_state = (
+            Qt.CheckState.Unchecked
+            if item.checkState() == Qt.CheckState.Checked
+            else Qt.CheckState.Checked
+        )
+        item.setCheckState(new_state)
+        self._dirty = True
+        self._refresh_text()
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def checkedItems(self) -> list[str]:
+        """Return the labels of all checked items."""
+        result = []
+        for i in range(self.model().rowCount()):
+            item = self.model().item(i)
+            if item and item.checkState() == Qt.CheckState.Checked:
+                result.append(item.text())
+        return result
+
+    def setChecked(self, text: str, checked: bool) -> None:
+        """Check or uncheck an item by its label (no-op if not found)."""
+        for i in range(self.model().rowCount()):
+            item = self.model().item(i)
+            if item and item.text() == text:
+                item.setCheckState(
+                    Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+                )
+                break
+        self._refresh_text()
+
+    def _refresh_text(self) -> None:
+        checked = self.checkedItems()
+        if not checked:
+            self.lineEdit().setText("")
+            self.lineEdit().setPlaceholderText("All categories")
+        elif len(checked) <= 2:
+            self.lineEdit().setText(", ".join(checked))
+        else:
+            self.lineEdit().setText(f"{len(checked)} categories")
+
+
 class RatioBar(QWidget):
     """Horizontal bar showing yes (green) / no (red) split."""
 
@@ -194,6 +294,7 @@ class EventDetailWindow(QWidget):
 
     _COLUMNS: list[tuple[str, int]] = [
         ("Market", 0),       # stretch
+        ("ID", 130),         # market id — fixed
         ("Yes", 65),
         ("No", 65),
         ("Ratio", 180),
@@ -202,8 +303,8 @@ class EventDetailWindow(QWidget):
     def __init__(self, event: dict, parent: QWidget | None = None) -> None:
         super().__init__(parent, Qt.WindowType.Window)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
-        self.setWindowTitle(event.get("title") or "Event detail")
-        self.resize(860, 560)
+        self._event_id = str(event.get("id", ""))
+        self.resize(1000, 560)
         self._build_ui(event)
 
     def _build_ui(self, event: dict) -> None:
@@ -212,28 +313,17 @@ class EventDetailWindow(QWidget):
         layout.setSpacing(8)
 
         # Title
-        title_lbl = QLabel(event.get("title") or "")
+        self._title_lbl = QLabel()
         f = QFont()
         f.setPointSize(13)
         f.setBold(True)
-        title_lbl.setFont(f)
-        title_lbl.setWordWrap(True)
-        layout.addWidget(title_lbl)
+        self._title_lbl.setFont(f)
+        self._title_lbl.setWordWrap(True)
+        layout.addWidget(self._title_lbl)
 
         # Subtitle row: end date + counts
-        end_raw = event.get("endDate", "")
-        end_dt = parse_dt(end_raw)
-        markets: list[dict] = event.get("markets") or []
-        time_text, time_color = time_remaining(end_raw)
-        sub_parts = []
-        if end_dt:
-            sub_parts.append(end_dt.strftime("Closes %b %d, %Y  %H:%M UTC"))
-        if time_text not in ("—", "Ended"):
-            sub_parts.append(f"({time_text} remaining)")
-        sub_parts.append(f"· {len(markets)} market{'s' if len(markets) != 1 else ''}")
-        sub_lbl = QLabel("  ".join(sub_parts))
-        sub_lbl.setStyleSheet(f"color: {time_color};")
-        layout.addWidget(sub_lbl)
+        self._sub_lbl = QLabel()
+        layout.addWidget(self._sub_lbl)
 
         sep = QFrame()
         sep.setFrameShape(QFrame.Shape.HLine)
@@ -241,24 +331,47 @@ class EventDetailWindow(QWidget):
         layout.addWidget(sep)
 
         # Markets table
-        table = QTableWidget()
-        table.setColumnCount(len(self._COLUMNS))
-        table.setHorizontalHeaderLabels([c[0] for c in self._COLUMNS])
-        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        table.setAlternatingRowColors(True)
-        table.setSortingEnabled(False)
-        table.verticalHeader().setVisible(False)
-        table.setShowGrid(False)
-        table.setWordWrap(True)
+        self._market_table = QTableWidget()
+        self._market_table.setColumnCount(len(self._COLUMNS))
+        self._market_table.setHorizontalHeaderLabels([c[0] for c in self._COLUMNS])
+        self._market_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self._market_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self._market_table.setAlternatingRowColors(True)
+        self._market_table.setSortingEnabled(False)
+        self._market_table.verticalHeader().setVisible(False)
+        self._market_table.setShowGrid(False)
+        self._market_table.setWordWrap(True)
 
-        hdr = table.horizontalHeader()
+        hdr = self._market_table.horizontalHeader()
         hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         for col, (_, width) in enumerate(self._COLUMNS[1:], start=1):
             hdr.setSectionResizeMode(col, QHeaderView.ResizeMode.Fixed)
-            table.setColumnWidth(col, width)
+            self._market_table.setColumnWidth(col, width)
 
-        table.setRowCount(len(markets))
+        layout.addWidget(self._market_table)
+
+        self._populate(event)
+
+    def _populate(self, event: dict) -> None:
+        title = event.get("title") or "Event detail"
+        self.setWindowTitle(f"{title}  [{self._event_id}]")
+        self._title_lbl.setText(title)
+
+        end_raw = event.get("endDate", "")
+        end_dt = parse_dt(end_raw)
+        markets: list[dict] = event.get("markets") or []
+        time_text, time_color = time_remaining(end_raw)
+
+        sub_parts = []
+        if end_dt:
+            sub_parts.append(end_dt.strftime("Closes %b %d, %Y  %H:%M UTC"))
+        if time_text not in ("—", "Ended"):
+            sub_parts.append(f"({time_text} remaining)")
+        sub_parts.append(f"· {len(markets)} market{'s' if len(markets) != 1 else ''}")
+        self._sub_lbl.setText("  ".join(sub_parts))
+        self._sub_lbl.setStyleSheet(f"color: {time_color};")
+
+        self._market_table.setRowCount(len(markets))
         for row, market in enumerate(markets):
             yes, no = _parse_yes_no(market)
 
@@ -266,17 +379,23 @@ class EventDetailWindow(QWidget):
             q_item.setTextAlignment(
                 Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft
             )
-            table.setItem(row, 0, q_item)
+            self._market_table.setItem(row, 0, q_item)
+
+            mid = str(market.get("id") or "—")
+            id_item = QTableWidgetItem(mid)
+            id_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            id_item.setForeground(QColor("#888888"))
+            self._market_table.setItem(row, 1, id_item)
 
             yes_item = QTableWidgetItem(f"{yes:.1%}" if yes is not None else "—")
             yes_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             yes_item.setForeground(QColor("#a6e3a1"))
-            table.setItem(row, 1, yes_item)
+            self._market_table.setItem(row, 2, yes_item)
 
             no_item = QTableWidgetItem(f"{no:.1%}" if no is not None else "—")
             no_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             no_item.setForeground(QColor("#f38ba8"))
-            table.setItem(row, 2, no_item)
+            self._market_table.setItem(row, 3, no_item)
 
             if yes is not None:
                 bar_wrap = QWidget()
@@ -284,10 +403,13 @@ class EventDetailWindow(QWidget):
                 bar_layout = QHBoxLayout(bar_wrap)
                 bar_layout.setContentsMargins(8, 4, 8, 4)
                 bar_layout.addWidget(RatioBar(yes))
-                table.setCellWidget(row, 3, bar_wrap)
+                self._market_table.setCellWidget(row, 4, bar_wrap)
 
-        table.resizeRowsToContents()
-        layout.addWidget(table)
+        self._market_table.resizeRowsToContents()
+
+    def refresh(self, event: dict) -> None:
+        """Re-populate with updated event data (called on each auto-refresh)."""
+        self._populate(event)
 
 
 # ---------------------------------------------------------------------------
@@ -357,8 +479,9 @@ class EventFetcher(QThread):
 
 class MainWindow(QMainWindow):
 
-    # (label, default_width)
+    # (label, width)  — col 0 is the ★ toggle, col 1 is Title (stretches)
     COLUMNS: list[tuple[str, int]] = [
+        ("★", 30),
         ("Title", 380),
         ("End Date (UTC)", 145),
         ("Time Left", 90),
@@ -377,6 +500,7 @@ class MainWindow(QMainWindow):
         self._all_events: list[dict] = []
         self._fetcher: Optional[EventFetcher] = None
         self._detail_windows: list[EventDetailWindow] = []
+        self._favorites: set[str] = db.load_favorites()
 
         # Initialise py-clob-client (read-only, no credentials required)
         self._clob = ClobClient(CLOB_API)
@@ -397,6 +521,32 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # UI construction
     # ------------------------------------------------------------------
+
+    def _make_table(self) -> QTableWidget:
+        """Create a QTableWidget pre-configured with the standard column layout."""
+        t = QTableWidget()
+        t.setColumnCount(len(self.COLUMNS))
+        t.setHorizontalHeaderLabels([c[0] for c in self.COLUMNS])
+        t.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        t.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        t.setAlternatingRowColors(True)
+        t.setSortingEnabled(True)
+        t.verticalHeader().setVisible(False)
+        t.setShowGrid(False)
+        t.setWordWrap(False)
+
+        hdr = t.horizontalHeader()
+        # col 0: ★ (fixed narrow)
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        t.setColumnWidth(0, self.COLUMNS[0][1])
+        # col 1: Title (stretches)
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        # col 2+: fixed widths
+        for col in range(2, len(self.COLUMNS)):
+            hdr.setSectionResizeMode(col, QHeaderView.ResizeMode.Fixed)
+            t.setColumnWidth(col, self.COLUMNS[col][1])
+
+        return t
 
     def _build_ui(self) -> None:
         root = QWidget()
@@ -420,10 +570,10 @@ class MainWindow(QMainWindow):
         self._count_label.setStyleSheet("color: #888;")
         header_row.addWidget(self._count_label)
 
-        self._category_combo = QComboBox()
-        self._category_combo.setFixedWidth(160)
-        self._category_combo.setToolTip("Filter by category")
-        self._category_combo.currentTextChanged.connect(self._apply_filter)
+        self._category_combo = CheckableComboBox()
+        self._category_combo.setFixedWidth(180)
+        self._category_combo.setToolTip("Filter by category — select one or more")
+        self._category_combo.selectionChanged.connect(self._apply_filter)
         header_row.addWidget(self._category_combo)
 
         self._search = QLineEdit()
@@ -445,27 +595,37 @@ class MainWindow(QMainWindow):
         sep.setFrameShadow(QFrame.Shadow.Sunken)
         layout.addWidget(sep)
 
-        # ── Table ───────────────────────────────────────────────────
-        self._table = QTableWidget()
-        self._table.setColumnCount(len(self.COLUMNS))
-        self._table.setHorizontalHeaderLabels([c[0] for c in self.COLUMNS])
-        self._table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self._table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self._table.setAlternatingRowColors(True)
-        self._table.setSortingEnabled(True)
-        self._table.verticalHeader().setVisible(False)
-        self._table.setShowGrid(False)
-        self._table.setWordWrap(False)
+        # ── Tab widget ──────────────────────────────────────────────
+        self._tabs = QTabWidget()
+        layout.addWidget(self._tabs)
 
-        hdr = self._table.horizontalHeader()
-        # Title column stretches; all others have fixed widths
-        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        for col, (_, width) in enumerate(self.COLUMNS[1:], start=1):
-            hdr.setSectionResizeMode(col, QHeaderView.ResizeMode.Fixed)
-            self._table.setColumnWidth(col, width)
+        # Events tab
+        events_container = QWidget()
+        events_layout = QVBoxLayout(events_container)
+        events_layout.setContentsMargins(0, 4, 0, 0)
+        self._table = self._make_table()
+        self._table.cellClicked.connect(
+            lambda r, c: self._on_cell_clicked(r, c, self._table)
+        )
+        self._table.cellDoubleClicked.connect(
+            lambda r, c: self._on_row_double_clicked(r, c, self._table)
+        )
+        events_layout.addWidget(self._table)
+        self._tabs.addTab(events_container, "Events")
 
-        self._table.cellDoubleClicked.connect(self._on_row_double_clicked)
-        layout.addWidget(self._table)
+        # Favorites tab
+        fav_container = QWidget()
+        fav_layout = QVBoxLayout(fav_container)
+        fav_layout.setContentsMargins(0, 4, 0, 0)
+        self._fav_table = self._make_table()
+        self._fav_table.cellClicked.connect(
+            lambda r, c: self._on_cell_clicked(r, c, self._fav_table)
+        )
+        self._fav_table.cellDoubleClicked.connect(
+            lambda r, c: self._on_row_double_clicked(r, c, self._fav_table)
+        )
+        fav_layout.addWidget(self._fav_table)
+        self._tabs.addTab(fav_container, "Favorites (0)")
 
         # ── Status bar ──────────────────────────────────────────────
         self._statusbar = QStatusBar()
@@ -489,7 +649,6 @@ class MainWindow(QMainWindow):
         self._apply_filter()
         last = db.last_fetched_at()
         if last:
-            # Convert stored UTC timestamp to local for display
             try:
                 ts = datetime.fromisoformat(last.replace("Z", "+00:00"))
                 local = ts.astimezone().strftime("%b %d  %H:%M")
@@ -517,6 +676,9 @@ class MainWindow(QMainWindow):
         self._fetcher.start()
 
     def _on_events_ready(self, events: list[dict]) -> None:
+        # Prune events that are no longer returned by the API
+        db.delete_stale_events([str(e.get("id", "")) for e in events])
+
         self._all_events = events
         self._refresh_category_combo()
         self._apply_filter()
@@ -525,12 +687,44 @@ class MainWindow(QMainWindow):
         self._statusbar.showMessage(f"Loaded {len(events)} events.", 5000)
         self._refresh_btn.setEnabled(True)
 
+        # Refresh any open detail windows with updated event data
+        events_by_id = {str(e.get("id", "")): e for e in events}
+        for win in self._detail_windows:
+            updated = events_by_id.get(win._event_id)
+            if updated:
+                win.refresh(updated)
+
     def _on_error(self, msg: str) -> None:
         self._statusbar.showMessage(f"Error — {msg}", 10_000)
         self._refresh_btn.setEnabled(True)
 
-    def _on_row_double_clicked(self, row: int, _col: int) -> None:
-        title_item = self._table.item(row, 0)
+    # ------------------------------------------------------------------
+    # Click / double-click handlers
+    # ------------------------------------------------------------------
+
+    def _on_cell_clicked(self, row: int, col: int, table: QTableWidget) -> None:
+        """Toggle favorite when the ★ column (col 0) is clicked."""
+        if col != 0:
+            return
+        title_item = table.item(row, 1)
+        if title_item is None:
+            return
+        event = title_item.data(Qt.ItemDataRole.UserRole)
+        if not event:
+            return
+        event_id = str(event.get("id", ""))
+        if event_id in self._favorites:
+            self._favorites.discard(event_id)
+            db.remove_favorite(event_id)
+        else:
+            self._favorites.add(event_id)
+            db.add_favorite(event_id)
+        self._apply_filter()
+
+    def _on_row_double_clicked(self, row: int, col: int, table: QTableWidget) -> None:
+        if col == 0:
+            return  # handled by cellClicked
+        title_item = table.item(row, 1)
         if title_item is None:
             return
         event = title_item.data(Qt.ItemDataRole.UserRole)
@@ -553,14 +747,13 @@ class MainWindow(QMainWindow):
             for e in self._all_events
             if self._event_category(e) != "—"
         })
-        current = self._category_combo.currentText()
+        previously_checked = set(self._category_combo.checkedItems())
         self._category_combo.blockSignals(True)
         self._category_combo.clear()
-        self._category_combo.addItem("All categories")
-        self._category_combo.addItems(categories)
-        # Restore previous selection if it still exists
-        idx = self._category_combo.findText(current)
-        self._category_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        for cat in categories:
+            self._category_combo.addItem(cat)
+            if cat in previously_checked:
+                self._category_combo.setChecked(cat, True)
         self._category_combo.blockSignals(False)
 
     @staticmethod
@@ -570,20 +763,26 @@ class MainWindow(QMainWindow):
 
     def _apply_filter(self, _: str = "") -> None:
         q = self._search.text().strip().lower()
-        cat = self._category_combo.currentText()
-        filter_cat = cat != "All categories"
+        selected_cats = set(self._category_combo.checkedItems())
 
         visible = [
             e for e in self._all_events
             if (not q or q in (e.get("title") or "").lower())
-            and (not filter_cat or self._event_category(e) == cat)
+            and (not selected_cats or self._event_category(e) in selected_cats)
         ]
         self._count_label.setText(f"{len(visible)} of {len(self._all_events)} events")
-        self._populate_table(visible)
+        self._populate_table(visible, self._table)
 
-    def _populate_table(self, events: list[dict]) -> None:
-        self._table.setSortingEnabled(False)
-        self._table.setRowCount(len(events))
+        fav_visible = [
+            e for e in visible
+            if str(e.get("id", "")) in self._favorites
+        ]
+        self._populate_table(fav_visible, self._fav_table)
+        self._tabs.setTabText(1, f"Favorites ({len(fav_visible)})")
+
+    def _populate_table(self, events: list[dict], table: QTableWidget) -> None:
+        table.setSortingEnabled(False)
+        table.setRowCount(len(events))
 
         for row, event in enumerate(events):
             end_raw = event.get("endDate", "")
@@ -597,7 +796,11 @@ class MainWindow(QMainWindow):
 
             markets: list[dict] = event.get("markets") or []
 
+            event_id = str(event.get("id", ""))
+            is_fav = event_id in self._favorites
+
             cells: list[tuple[str, Optional[str]]] = [
+                ("★" if is_fav else "☆", "#FFD700" if is_fav else "#585b70"),
                 (event.get("title") or "—", None),
                 (end_display, None),
                 (time_text, time_color),
@@ -612,18 +815,18 @@ class MainWindow(QMainWindow):
                 item = QTableWidgetItem(text)
                 align = (
                     Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft
-                    if col == 0
+                    if col == 1
                     else Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignCenter
                 )
                 item.setTextAlignment(align)
                 if color:
                     item.setForeground(QColor(color))
-                if col == 0:
+                if col == 1:
                     item.setData(Qt.ItemDataRole.UserRole, event)
-                self._table.setItem(row, col, item)
+                table.setItem(row, col, item)
 
-        self._table.setSortingEnabled(True)
-        self._table.resizeRowsToContents()
+        table.setSortingEnabled(True)
+        table.resizeRowsToContents()
 
 
 # ---------------------------------------------------------------------------
@@ -701,6 +904,18 @@ def main() -> None:
         "  border: 1px solid #45475a;"
         "}"
         "QStatusBar { color: #888; }"
+        "QTabWidget::pane { border: none; }"
+        "QTabBar::tab {"
+        "  background: #313244;"
+        "  color: #cdd6f4;"
+        "  padding: 6px 16px;"
+        "  border: 1px solid #45475a;"
+        "  border-bottom: none;"
+        "  border-radius: 4px 4px 0 0;"
+        "  margin-right: 2px;"
+        "}"
+        "QTabBar::tab:selected { background: #45475a; color: #cdd6f4; }"
+        "QTabBar::tab:hover    { background: #3d3f56; }"
     )
 
     win = MainWindow()

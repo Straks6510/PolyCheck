@@ -1,12 +1,2 @@
-# Ignore everything in the venv
+# Created by venv; see https://docs.python.org/3/library/venv.html
 *
-
-# But track source files
-!.gitignore
-!CLAUDE.md
-!*.py
-!*.txt
-!*.md
-!*.toml
-!*.cfg
-!src/
